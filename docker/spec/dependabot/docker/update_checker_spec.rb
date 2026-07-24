@@ -1067,50 +1067,207 @@ RSpec.describe Dependabot::Docker::UpdateChecker do
 
       context "when listing the full tag list times out (504)" do
         let(:tags_url) { "https://registry.hub.docker.com/v2/moj/ruby/tags/list" }
-        let(:next_page_url) { tags_url + "?last=2.4.1&n=100" }
+        let(:docker_hub_tags_url) { "https://hub.docker.com/v2/repositories/moj/ruby/tags" }
+        let(:version) { "2.4.0-slim" }
+        let(:second_page_url) do
+          docker_hub_tags_url + "?name=slim&ordering=last_updated&page=2&page_size=100"
+        end
         let(:first_page_tags) do
-          JSON.generate("name" => dependency_name, "tags" => ["2.4.1"])
+          JSON.generate(
+            "count" => 2,
+            "next" => second_page_url,
+            "previous" => nil,
+            "results" => [{ "name" => "2.4.1-slim" }]
+          )
         end
         let(:second_page_tags) do
-          JSON.generate("name" => dependency_name, "tags" => ["2.4.2"])
+          JSON.generate(
+            "count" => 2,
+            "next" => nil,
+            "previous" => docker_hub_tags_url,
+            "results" => [{ "name" => "2.4.2-slim" }]
+          )
         end
 
         before do
-          # Registries such as Docker Hub 504 when asked for the full tag list of
-          # images with huge tag counts; the request must be retried paginated.
           stub_request(:get, tags_url)
             .and_return(status: 504, body: "")
-          stub_request(:get, tags_url + "?n=100")
+          stub_request(:get, docker_hub_tags_url)
+            .with(
+              query: {
+                "name" => "slim",
+                "ordering" => "last_updated",
+                "page" => "1",
+                "page_size" => "100"
+              }
+            )
             .and_return(
               status: 200,
               body: first_page_tags,
-              headers: { "Link" => "<#{next_page_url}>; rel=\"next\"" }
+              headers: { "Content-Type" => "application/json" }
             )
-          stub_request(:get, next_page_url)
-            .and_return(status: 200, body: second_page_tags)
+          stub_request(:get, docker_hub_tags_url)
+            .with(
+              query: {
+                "name" => "slim",
+                "ordering" => "last_updated",
+                "page" => "2",
+                "page_size" => "100"
+              }
+            )
+            .and_return(
+              status: 200,
+              body: second_page_tags,
+              headers: { "Content-Type" => "application/json" }
+            )
         end
 
-        it "falls back to a paginated request and resolves the latest version" do
-          expect(checker.latest_version).to eq("2.4.2")
-          expect(WebMock).to have_requested(:get, tags_url + "?n=100")
-          expect(WebMock).to have_requested(:get, next_page_url)
+        it "falls back to the filtered Docker Hub API and resolves the latest version" do
+          expect(checker.latest_version).to eq("2.4.2-slim")
+          expect(WebMock).to have_requested(:get, second_page_url)
+          expect(WebMock).not_to have_requested(:get, tags_url + "?n=100")
         end
       end
 
-      context "when the tag list request keeps returning a 504" do
+      context "when a large Docker Hub repository has a compound tag family" do
+        let(:dependency_name) { "hexpm/elixir" }
+        let(:version) { "1.18.2-erlang-27.2.2-alpine-3.21.2" }
+        let(:tags_url) { "https://registry.hub.docker.com/v2/hexpm/elixir/tags/list" }
+        let(:docker_hub_tags_url) { "https://hub.docker.com/v2/repositories/hexpm/elixir/tags" }
+        let(:docker_hub_tags) do
+          JSON.generate(
+            "count" => 2,
+            "next" => nil,
+            "previous" => nil,
+            "results" => [
+              { "name" => "1.18.4-erlang-27.3.4-alpine-3.21.7" },
+              { "name" => "1.20.2-erlang-29.0.3-alpine-3.23.5" }
+            ]
+          )
+        end
+
+        before do
+          stub_request(:get, tags_url)
+            .and_return(status: 504, body: "")
+          stub_request(:get, docker_hub_tags_url)
+            .with(
+              query: {
+                "name" => "alpine",
+                "ordering" => "last_updated",
+                "page" => "1",
+                "page_size" => "100"
+              }
+            )
+            .and_return(
+              status: 200,
+              body: docker_hub_tags,
+              headers: { "Content-Type" => "application/json" }
+            )
+        end
+
+        it "uses the platform family to find a compatible update" do
+          expect(checker.latest_version).to eq("1.20.2-erlang-29.0.3-alpine-3.23.5")
+        end
+      end
+
+      context "when Docker Hub credentials are configured" do
         let(:tags_url) { "https://registry.hub.docker.com/v2/moj/ruby/tags/list" }
+        let(:docker_hub_tags_url) { "https://hub.docker.com/v2/repositories/moj/ruby/tags" }
+        let(:credentials) do
+          [
+            Dependabot::Credential.new(
+              {
+                "type" => "docker_registry",
+                "registry" => "registry.hub.docker.com",
+                "username" => "grey",
+                "password" => "pa55word"
+              }
+            )
+          ]
+        end
 
         before do
           stub_request(:get, tags_url)
             .and_return(status: 504, body: "")
           stub_request(:get, tags_url + "?n=100")
+            .and_return(status: 200, body: registry_tags)
+        end
+
+        it "keeps using the authenticated registry API" do
+          expect(checker.latest_version).to eq("2.4.2")
+          expect(WebMock).not_to have_requested(:get, docker_hub_tags_url)
+        end
+      end
+
+      context "when the Docker Hub fallback has more than 20 pages" do
+        let(:tags_url) { "https://registry.hub.docker.com/v2/moj/ruby/tags/list" }
+        let(:docker_hub_tags_url) { "https://hub.docker.com/v2/repositories/moj/ruby/tags" }
+        let(:version) { "2.4.0-slim" }
+        let(:docker_hub_tags) do
+          JSON.generate(
+            "count" => 10_000,
+            "next" => docker_hub_tags_url + "?page=2",
+            "previous" => nil,
+            "results" => [{ "name" => "2.4.1-slim" }]
+          )
+        end
+
+        before do
+          stub_request(:get, tags_url)
             .and_return(status: 504, body: "")
+          stub_request(:get, docker_hub_tags_url)
+            .with(
+              query: hash_including(
+                "name" => "slim",
+                "ordering" => "last_updated",
+                "page_size" => "100"
+              )
+            )
+            .and_return(
+              status: 200,
+              body: docker_hub_tags,
+              headers: { "Content-Type" => "application/json" }
+            )
+        end
+
+        it "stops after the bounded number of pages" do
+          expect(checker.latest_version).to eq("2.4.1-slim")
+          expect(WebMock).to have_requested(:get, docker_hub_tags_url)
+            .with(
+              query: hash_including(
+                "name" => "slim",
+                "ordering" => "last_updated",
+                "page_size" => "100"
+              )
+            )
+            .times(20)
+        end
+      end
+
+      context "when the Docker Hub fallback returns a server error" do
+        let(:tags_url) { "https://registry.hub.docker.com/v2/moj/ruby/tags/list" }
+        let(:docker_hub_tags_url) { "https://hub.docker.com/v2/repositories/moj/ruby/tags" }
+        let(:version) { "2.4.0-slim" }
+
+        before do
+          stub_request(:get, tags_url)
+            .and_return(status: 504, body: "")
+          stub_request(:get, docker_hub_tags_url)
+            .with(
+              query: {
+                "name" => "slim",
+                "ordering" => "last_updated",
+                "page" => "1",
+                "page_size" => "100"
+              }
+            )
+            .and_return(status: 503, body: "")
         end
 
         it "raises a RegistryError with the HTTP status" do
           expect { checker.latest_version }
             .to raise_error(Dependabot::RegistryError) do |error|
-              expect(error.status).to eq(504)
+              expect(error.status).to eq(503)
             end
         end
       end

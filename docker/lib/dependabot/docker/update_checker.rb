@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "docker_registry2"
+require "faraday"
 require "sorbet-runtime"
 
 begin
@@ -80,13 +81,11 @@ module Dependabot
       # so we cap the attempts to avoid rate limiting or excessive latency.
       MAX_PLATFORM_VALIDATION_ATTEMPTS = T.let(5, Integer)
 
-      # Page size used when listing tags from a registry. Without an explicit page
-      # size, registries such as Docker Hub try to return every tag in a single
-      # response, which times out (HTTP 504) for images with very large tag counts
-      # (e.g. hexpm/elixir has ~1M tags). Requesting a bounded page keeps each
-      # request fast; the client then follows the registry's pagination links to
-      # collect the remaining tags.
-      TAGS_PAGE_SIZE = T.let(100, Integer)
+      REGISTRY_TAGS_PAGE_SIZE = T.let(100, Integer)
+      DOCKER_HUB_API_URL = "https://hub.docker.com"
+      DOCKER_HUB_TAGS_PAGE_SIZE = T.let(100, Integer)
+      DOCKER_HUB_TAGS_MAX_PAGES = T.let(20, Integer)
+      DOCKER_HUB_VERSION_LABEL = /\A(?:alpha|beta|rc\d*|dev|preview|nightly|snapshot|canary|unstable)\z/i
 
       DockerSource = T.type_alias do
         T::Hash[Symbol, T.nilable(String)]
@@ -98,6 +97,10 @@ module Dependabot
 
       ManifestList = T.type_alias do
         T::Array[ManifestHash]
+      end
+
+      DockerHubTagsResponse = T.type_alias do
+        T::Hash[String, Object]
       end
 
       # Legacy patterns used when docker_created_timestamp_validation experiment is disabled.
@@ -739,11 +742,6 @@ module Dependabot
         raise
       end
 
-      # Registries such as Docker Hub time out (HTTP 504) when asked to return the
-      # full tag list for images with very large tag counts (e.g. hexpm/elixir has
-      # ~1M tags). Request the list without a page size first — a single efficient
-      # call for the common case — and fall back to a paginated request when the
-      # registry can't return everything at once.
       sig { params(page_size: T.nilable(Integer)).returns(T::Array[Dependabot::Docker::Tag]) }
       def fetch_tags_from_registry(page_size: nil)
         client = docker_registry_client
@@ -761,9 +759,136 @@ module Dependabot
 
         retry
       rescue DockerRegistry2::RegistryHTTPException => e
-        raise if page_size || registry_http_status(e) == 429
+        status = registry_http_status(e)
+        raise unless status.between?(500, 599)
+        return fetch_tags_from_docker_hub(registry_status: status) if docker_hub_tags_fallback?
+        raise if page_size
 
-        fetch_tags_from_registry(page_size: TAGS_PAGE_SIZE)
+        fetch_tags_from_registry(page_size: REGISTRY_TAGS_PAGE_SIZE)
+      end
+
+      sig { params(registry_status: Integer).returns(T::Array[Dependabot::Docker::Tag]) }
+      def fetch_tags_from_docker_hub(registry_status:)
+        # Docker Hub's Registry V2 endpoint times out while enumerating very large repositories.
+        # The web API supports filtered, bounded pages, avoiding an unbounded crawl of the tag set.
+        tags = T.let([], T::Array[Dependabot::Docker::Tag])
+        next_page = T.let(false, T::Boolean)
+
+        1.upto(DOCKER_HUB_TAGS_MAX_PAGES) do |page|
+          body = fetch_docker_hub_tags_page(page)
+          tags.concat(docker_hub_tags_from(body))
+          next_page = body["next"].is_a?(String)
+          break unless next_page
+        end
+
+        if next_page
+          Dependabot.logger.info(
+            "Docker Hub tags API: stopped after #{DOCKER_HUB_TAGS_MAX_PAGES} pages for #{docker_repo_name}"
+          )
+        end
+
+        tags
+      rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
+        raise RegistryError.new(registry_status, e.message)
+      end
+
+      sig { params(page: Integer).returns(DockerHubTagsResponse) }
+      def fetch_docker_hub_tags_page(page)
+        response = docker_hub_client.get(
+          "/v2/repositories/#{docker_repo_name}/tags",
+          docker_hub_tags_query(page)
+        )
+        unless response.success?
+          raise RegistryError.new(
+            response.status,
+            "Docker Hub tags API request failed with status #{response.status}"
+          )
+        end
+
+        T.cast(JSON.parse(response.body), DockerHubTagsResponse)
+      end
+
+      sig { params(body: DockerHubTagsResponse).returns(T::Array[Dependabot::Docker::Tag]) }
+      def docker_hub_tags_from(body)
+        results = T.cast(body.fetch("results"), T::Array[T::Hash[String, Object]])
+        results.filter_map do |result|
+          name = result["name"]
+          Tag.new(name) if name.is_a?(String)
+        end
+      end
+
+      sig { params(page: Integer).returns(T::Hash[Symbol, T.any(Integer, String)]) }
+      def docker_hub_tags_query(page)
+        query = T.let(
+          {
+            page_size: DOCKER_HUB_TAGS_PAGE_SIZE,
+            page: page,
+            # Docker Hub treats this value as newest-first; "-last_updated" returns oldest-first.
+            ordering: "last_updated"
+          },
+          T::Hash[Symbol, T.any(Integer, String)]
+        )
+        search_term = docker_hub_tag_search_term
+        query[:name] = search_term if search_term
+        query
+      end
+
+      sig { returns(T.nilable(String)) }
+      def docker_hub_tag_search_term
+        return "latest" if version_tag.digest?
+
+        longest_docker_hub_tag_component_group&.join("-")
+      end
+
+      sig { returns(T.nilable(T::Array[String])) }
+      def longest_docker_hub_tag_component_group
+        best_group = T.let(nil, T.nilable(T::Array[String]))
+        docker_hub_tag_component_groups.each do |group|
+          best_group = group if !best_group || group.join("-").length >= best_group.join("-").length
+        end
+        best_group
+      end
+
+      sig { returns(T::Array[T::Array[String]]) }
+      def docker_hub_tag_component_groups
+        component_groups = T.let([], T::Array[T::Array[String]])
+        current_group = T.let([], T::Array[String])
+
+        version_tag.name.split("-").each do |part|
+          component = docker_hub_static_tag_component(part)
+          if component
+            current_group << component
+          elsif current_group.any?
+            component_groups << current_group
+            current_group = []
+          end
+        end
+        component_groups << current_group if current_group.any?
+        component_groups
+      end
+
+      sig { params(part: String).returns(T.nilable(String)) }
+      def docker_hub_static_tag_component(part)
+        return if part.match?(DOCKER_HUB_VERSION_LABEL)
+
+        part.match(/\A([a-z]{3,})(?:\d.*)?\z/i)&.captures&.first&.downcase
+      end
+
+      sig { returns(T::Boolean) }
+      def docker_hub_tags_fallback?
+        using_dockerhub? && registry_credentials.nil?
+      end
+
+      sig { returns(Faraday::Connection) }
+      def docker_hub_client
+        @docker_hub_client ||= T.let(
+          Faraday.new(url: DOCKER_HUB_API_URL, proxy: ENV.fetch("HTTPS_PROXY", nil)) do |connection|
+            connection.options.open_timeout = docker_open_timeout_in_seconds
+            connection.options.timeout = docker_read_timeout_in_seconds
+            connection.headers["Accept"] = "application/json"
+          end,
+          T.nilable(Faraday::Connection)
+        )
       end
 
       # docker_registry2 1.19.0 only exposes the status in the exception message.
